@@ -7,8 +7,9 @@ flags files with problems.
 Same checks as the original script:
     - Error:   the frame rate can't be read, or is 0 or less.
     - Warning: the frame rate mode is variable, or missing.
-Plus optional extras: flag a minimum frame rate below a threshold, and show
-resolution, codec and duration for every file.
+Plus optional extras: flag a minimum frame rate below a threshold, show
+resolution, codec and duration for every file, and verify each file against
+the CRC32 code in its name ("[80186B58]"), which catches damaged downloads.
 
 Part of Media Toolbox; can also be run on its own:  python video_check.py
 Requires:  pip install pymediainfo
@@ -18,6 +19,7 @@ Requires:  pip install pymediainfo
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -31,7 +33,8 @@ from common import (
     DIM_COLOR, ERROR_COLOR, OK_COLOR, WARN_COLOR, Batcher, Column, FolderPicker, RecordFilter,
     RecordModel, ToolTab, export_csv, human_duration, human_size, load_tool_settings,
     make_table_view, missing_library_banner, parse_extensions, remember_recent, run_standalone,
-    save_tool_settings, selected_records,
+    save_tool_settings, save_text, selected_records, timestamp, created_line,
+    crc_in_name, file_hash, hash_cache, require_folder,
 )
 
 # pymediainfo is optional: without it this tab explains how to install it,
@@ -48,6 +51,7 @@ DEFAULT_SETTINGS = {
     "extensions": [".mp4", ".mkv", ".avi", ".mov", ".webm"],
     "recursive": True,          # The original script always looked in every subfolder.
     "min_fps_warning": 0.0,     # 0 = off. Otherwise warn when Minimum FPS is below this.
+    "verify_crc": False,        # Off by default: it reads every byte of every file.
 }
 
 
@@ -71,17 +75,41 @@ def find_files(root: Path, extensions: list[str], recursive: bool) -> list[Path]
                   key=lambda p: p.name.lower())
 
 
-def check_video(path: Path, root: Path, settings: dict) -> dict:
+def check_video(path: Path, root: Path, settings: dict, cancelled=None) -> dict:
     """Read one file and return a table row with its values and problems."""
+    row = _check_media(path, root, settings)
+    row["crc"] = ""
+    if settings.get("verify_crc"):
+        expected = crc_in_name(path.name)
+        if not expected:
+            row["crc"] = "No code in name"
+        else:
+            # Unchanged files come from the checksum cache without being read again.
+            actual = file_hash(path, "CRC32", cancelled)
+            if not actual:
+                row["crc"] = "Not checked"  # Unreadable, or cancelled halfway.
+            elif actual == expected:
+                row["crc"] = "OK"
+            else:
+                row["crc"] = f"Mismatch ({actual})"
+                row["errors"].append(f"CRC32 is {actual} but the name says {expected}: the file may be damaged")
+    return _finish(row)  # Again, so a CRC error updates the result.
+
+
+def _check_media(path: Path, root: Path, settings: dict) -> dict:
+    """The MediaInfo part of the check."""
     try:
-        size = path.stat().st_size
+        st = path.stat()
+        size, mtime = st.st_size, st.st_mtime
     except OSError:
-        size = -1
+        size, mtime = -1, 0
     row = {
         "path": str(path), "file": path.name, "folder": _relative_folder(path, root),
         "fps": None, "mode": "", "min_fps": None, "max_fps": None,
         "resolution": "", "pixels": -1, "codec": "", "duration": None, "duration_text": "",
         "size": size, "size_text": human_size(size) if size >= 0 else "",
+        "mtime": mtime,
+        "modified": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M") if mtime else "",
         "errors": [], "warnings": [],
     }
     try:
@@ -161,6 +189,7 @@ def scan_videos(root: Path, settings: dict, progress=None, cancelled=None, emit=
     """Check every video under root, streaming rows to the tab as they're ready."""
     if progress:
         progress(0, 0, "Looking for video files…")
+    require_folder(root)
     files = find_files(root, settings["extensions"], settings.get("recursive", True))
     batch = Batcher(emit)
     done = 0
@@ -169,9 +198,11 @@ def scan_videos(root: Path, settings: dict, progress=None, cancelled=None, emit=
             break
         if progress:
             progress(n, len(files), p.name)
-        batch.add(check_video(p, root, settings))
+        batch.add(check_video(p, root, settings, cancelled))
         done += 1
     batch.flush()
+    if settings.get("verify_crc"):
+        hash_cache().save()
     return {"found": len(files), "checked": done}
 
 
@@ -182,7 +213,9 @@ def recheck(paths: list[Path], root: Path, settings: dict, progress=None, cancel
             break
         if progress:
             progress(n, len(paths), p.name)
-        rows.append(check_video(p, root, settings))
+        rows.append(check_video(p, root, settings, cancelled))
+    if settings.get("verify_crc"):
+        hash_cache().save()
     return rows
 
 
@@ -193,7 +226,7 @@ def text_report(rows: list[dict], root: str) -> str:
     mode_warn = sum(1 for r in rows if any("frame rate mode" in w.lower() or "variable" in w.lower()
                                            for w in r["warnings"]))
     lines = [
-        f"Video check report for: {root}", "=" * 60,
+        f"Video check report for: {root}", created_line(), "=" * 60,
         f"Files checked:                 {len(rows)}",
         f"No problems:                   {ok}",
         f"Frame rate errors:             {fps_err}",
@@ -228,6 +261,8 @@ COLUMNS = [
     Column("codec", "Codec"),
     Column("duration_text", "Duration", sort_key="duration", numeric=True),
     Column("size_text", "Size", sort_key="size", numeric=True),
+    Column("modified", "Modified", sort_key="mtime", numeric=True),
+    Column("crc", "CRC", width=130),
     Column("issues", "Issues", width=260),
     Column("folder", "Folder", width=200),
 ]
@@ -237,6 +272,7 @@ SHOW_OPTIONS = ["All files", "Problems only", "Errors only", "Warnings only", "O
 
 class VideoCheckTab(ToolTab):
     title = "Video Check"
+    key = "video_check"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -275,6 +311,12 @@ class VideoCheckTab(ToolTab):
         self.min_spin.setValue(self.settings.get("min_fps_warning", 0) or 0)
         self.min_spin.setToolTip("Adds a warning when a file's minimum frame rate is lower than this. 0 = off.")
         opts.addWidget(self.min_spin)
+        self.crc_chk = QCheckBox("Verify CRC32 in name")
+        self.crc_chk.setToolTip("Compares each file with the [80186B58] code in its name, to catch damaged\n"
+                                "downloads. Reads every byte, so it's slower; unchanged files are\n"
+                                "remembered and not read again next time.")
+        self.crc_chk.setChecked(self.settings.get("verify_crc", False))
+        opts.addWidget(self.crc_chk)
         opts.addStretch()
         self.b_start = QPushButton("Check videos")
         self.b_start.setDefault(True)
@@ -318,6 +360,7 @@ class VideoCheckTab(ToolTab):
         bottom.addStretch()
         bottom.addWidget(b_csv)
         bottom.addWidget(b_txt)
+        self.add_open_last_buttons(bottom)
         lay.addLayout(bottom)
 
         QShortcut(QKeySequence("F5"), self, activated=self.start,
@@ -337,6 +380,7 @@ class VideoCheckTab(ToolTab):
         self.settings["extensions"] = parse_extensions(self.ext_edit.text()) or DEFAULT_SETTINGS["extensions"]
         self.settings["recursive"] = self.recursive_chk.isChecked()
         self.settings["min_fps_warning"] = self.min_spin.value()
+        self.settings["verify_crc"] = self.crc_chk.isChecked()
         self.ext_edit.setText(", ".join(self.settings["extensions"]))
 
     def update_summary(self):
@@ -359,15 +403,13 @@ class VideoCheckTab(ToolTab):
         if self.busy or MediaInfo is None:
             return
         root = self.folder.path()
-        if not root or not root.is_dir():
-            QMessageBox.warning(self, "Folder not found", f"'{self.folder.text()}' doesn't exist or isn't a folder.")
+        if not root:
+            QMessageBox.warning(self, "No folder", "Choose a folder first.")
             return
+        # Whether the folder exists is checked in the background task (never here:
+        # on a disconnected drive that alone can freeze the window).
         self._read_options()
-        self.settings["recent_folders"] = remember_recent(self.settings["recent_folders"], root)
         save_tool_settings(SETTINGS_KEY, self.settings)
-        self.folder.set_recent(self.settings["recent_folders"])
-        self.folder.set_text(str(root))
-
         self.scanned_root = root
         self.model.set_rows([])
         self.update_summary()
@@ -377,6 +419,11 @@ class VideoCheckTab(ToolTab):
             self.update_summary()
 
         def finished(result):
+            # The folder exists: now it's worth remembering.
+            self.settings["recent_folders"] = remember_recent(self.settings["recent_folders"], root)
+            save_tool_settings(SETTINGS_KEY, self.settings)
+            self.folder.set_recent(self.settings["recent_folders"])
+            self.folder.set_text(str(root))
             note = "" if result["checked"] == result["found"] else f" (cancelled after {result['checked']})"
             self.write_log(f"Checked {result['checked']} of {result['found']} video(s) in {root}{note}.")
             self.update_summary()
@@ -410,17 +457,16 @@ class VideoCheckTab(ToolTab):
         path = self.ask_save("Export CSV", "video_check.csv", "CSV files (*.csv)")
         if path:
             cols = COLUMNS + [Column("path", "Full path")]
-            export_csv(path, cols, rows)
-            self.write_log(f"Exported {len(rows)} row(s) to {path}")
+            self.save_in_background(export_csv, (path, cols, rows, [["Folder checked", str(self.scanned_root or "")]]),
+                                    path, f"{len(rows)} row(s)")
 
     def export_txt(self):
         if not self.model.rows:
             return
         path = self.ask_save("Save report", "video_check_report.txt", "Text files (*.txt)")
         if path:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text_report(self.model.rows, str(self.scanned_root or "")))
-            self.write_log(f"Report saved to {path}")
+            self.save_in_background(save_text, (path, text_report, list(self.model.rows),
+                                                str(self.scanned_root or "")), path, "the report")
 
     # ---------------------------------------------------------- context menu
     def show_menu(self, pos):
@@ -439,6 +485,7 @@ class VideoCheckTab(ToolTab):
         m.addAction("Copy issues",
                     lambda: QApplication.clipboard().setText(
                         "\n".join(f"{r['file']}: {r['issues'] or 'OK'}" for r in rows)))
+        self.add_link_actions(m, first.parent)
         m.exec(self.table.viewport().mapToGlobal(pos))
 
 

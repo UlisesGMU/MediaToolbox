@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import hashlib
 import inspect
 import json
 import os
@@ -23,10 +24,12 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import zlib
 
 from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, QObject, QSortFilterProxyModel, Qt, QThread, Signal, Slot,
@@ -39,6 +42,13 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "Media Toolbox"
+
+# The one place the version lives. Everything else (window title, About,
+# exports, settings backups, the .exe properties) reads it from here.
+# MAJOR.MINOR.PATCH: MAJOR for big changes (like joining the scripts into tabs),
+# MINOR for new features, PATCH for fixes. What changed in each is in CHANGELOG.md.
+APP_VERSION = "3.4.0"
+APP_TITLE = f"{APP_NAME} {APP_VERSION}"
 
 # Text colors used by every tab, chosen to stay readable on light and dark themes.
 OK_COLOR = "#2e9b4f"
@@ -146,6 +156,282 @@ def human_size(n: float) -> str:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
+
+
+def size_with_bytes(n: int) -> str:
+    """'1.2 GB (1,288,490,188 bytes)': friendly and exact in one string."""
+    if n is None or n < 0:
+        return ""
+    return f"{human_size(n)} ({n:,} {'byte' if n == 1 else 'bytes'})"
+
+
+def timestamp() -> str:
+    """Date and time written inside exported files."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def created_line() -> str:
+    """'Created: 2026-09-24 14:05:33 with Media Toolbox 3.1.0', for the top of text reports.
+    The version tells you which rules and patterns produced an older report."""
+    return f"Created: {timestamp()} with {APP_TITLE}"
+
+
+def stamped_name(name: str) -> str:
+    """'report.txt' -> 'report_2026-09-24_14-05-33.txt', so exports never overwrite each other."""
+    p = Path(name)
+    return f"{p.stem}_{datetime.now():%Y-%m-%d_%H-%M-%S}{p.suffix}"
+
+
+# =============================================================== checksums
+
+try:
+    import xxhash  # Optional: pip install xxhash
+except ImportError:  # pragma: no cover - depends on the machine
+    xxhash = None
+
+# CRC32 first: it's fast, built into Python, and it's the 8-character code
+# release groups put in file names ("[80186B58]"), so files can be verified.
+HASH_ALGORITHMS = ["CRC32", "xxHash", "MD5", "SHA-1", "SHA-256"]
+HASH_NOTES = {
+    "CRC32": "Fast, built in. Matches the [80186B58] code in release file names.",
+    "xxHash": "Fastest. Needs: pip install xxhash",
+    "MD5": "Common for comparing files; slower than CRC32.",
+    "SHA-1": "Slower than MD5.",
+    "SHA-256": "Slowest; the one to use when security matters.",
+}
+
+# "[80186B58]" in a file name: the CRC32 the release group published.
+CRC_TAG = re.compile(r"\[([0-9A-Fa-f]{8})\]")
+
+
+class _CRC32:
+    """Gives zlib.crc32 the same update()/hexdigest() interface as hashlib."""
+
+    def __init__(self):
+        self.value = 0
+
+    def update(self, data: bytes) -> None:
+        self.value = zlib.crc32(data, self.value)
+
+    def hexdigest(self) -> str:
+        return f"{self.value & 0xFFFFFFFF:08X}"  # Uppercase, like in file names.
+
+
+def hash_available(algorithm: str) -> bool:
+    return algorithm != "xxHash" or xxhash is not None
+
+
+def new_hasher(algorithm: str):
+    if algorithm == "CRC32":
+        return _CRC32()
+    if algorithm == "xxHash":
+        if xxhash is None:
+            raise RuntimeError("xxHash needs the xxhash package:  pip install xxhash")
+        return xxhash.xxh3_64()
+    return hashlib.new(algorithm.replace("-", "").lower())
+
+
+class HashCache:
+    """Remembers checksums by path, size and modification time, so a file that
+    hasn't changed is never read twice. Shared by every tab; thread-safe,
+    since two tabs can be hashing at the same time.
+
+    Stored in checksum_cache.json. Entries for files not seen for a year are
+    dropped when saving, so the file doesn't grow forever.
+    """
+    PRUNE_SECONDS = 365 * 24 * 3600
+
+    def __init__(self):
+        self.path = config_dir() / "checksum_cache.json"
+        data = load_json(self.path, {})
+        self.data: dict[str, dict] = data if isinstance(data, dict) else {}
+        self.dirty = False
+        self.lock = threading.Lock()
+
+    def get(self, path: Path, size: int, mtime: float, algorithm: str) -> str | None:
+        with self.lock:
+            e = self.data.get(str(path))
+            # Size and date must match: any change to the file means reading it again.
+            if e and e.get("size") == size and abs(e.get("mtime", 0) - mtime) < 1 and algorithm in e:
+                e["seen"] = time.time()
+                self.dirty = True
+                return e[algorithm]
+        return None
+
+    def put(self, path: Path, size: int, mtime: float, algorithm: str, value: str) -> None:
+        with self.lock:
+            e = self.data.get(str(path))
+            if not e or e.get("size") != size or abs(e.get("mtime", 0) - mtime) >= 1:
+                e = {"size": size, "mtime": mtime}  # File changed: old checksums are useless.
+            e[algorithm] = value
+            e["seen"] = time.time()
+            self.data[str(path)] = e
+            self.dirty = True
+
+    def save(self) -> None:
+        with self.lock:
+            if not self.dirty:
+                return
+            cutoff = time.time() - self.PRUNE_SECONDS
+            self.data = {k: v for k, v in self.data.items() if v.get("seen", 0) >= cutoff}
+            try:
+                save_json(self.path, self.data)
+                self.dirty = False
+            except OSError:
+                pass  # A cache that can't be saved only costs speed next time.
+
+    def clear(self) -> int:
+        with self.lock:
+            n = len(self.data)
+            self.data = {}
+            self.dirty = True
+        self.save()
+        return n
+
+
+_hash_cache: HashCache | None = None
+
+
+def hash_cache() -> HashCache:
+    global _hash_cache
+    if _hash_cache is None:
+        _hash_cache = HashCache()
+    return _hash_cache
+
+
+def file_hash(path: Path, algorithm: str, cancelled=None, use_cache: bool = True) -> str:
+    """Checksum of a file, read in 4 MB chunks so big videos don't fill memory.
+    Unchanged files come from the checksum cache without being read.
+    Returns "" if the file can't be read or the task was cancelled midway.
+    Call hash_cache().save() when a batch of files is done."""
+    try:
+        st = path.stat()
+    except OSError:
+        return ""
+    cache = hash_cache() if use_cache else None
+    if cache:
+        hit = cache.get(path, st.st_size, st.st_mtime, algorithm)
+        if hit:
+            return hit
+    h = new_hasher(algorithm)
+    try:
+        with open(path, "rb") as f:
+            for n, chunk in enumerate(iter(lambda: f.read(4 << 20), b"")):
+                h.update(chunk)
+                if cancelled and n % 16 == 15 and cancelled():  # Check every 64 MB.
+                    return ""
+    except OSError:
+        return ""
+    value = h.hexdigest()
+    if cache:
+        cache.put(path, st.st_size, st.st_mtime, algorithm, value)
+    return value
+
+
+def crc_in_name(name: str) -> str:
+    """The CRC32 written in a file name, or "" if there isn't one."""
+    found = CRC_TAG.findall(name)
+    return found[-1].upper() if found else ""
+
+
+try:
+    from send2trash import send2trash  # Optional: pip install send2trash
+except ImportError:  # pragma: no cover - depends on the machine
+    send2trash = None
+
+
+def delete_is_recoverable() -> bool:
+    """True when deleted files go to the Recycle Bin / Trash instead of disappearing."""
+    return send2trash is not None
+
+
+def delete_files(paths: list[Path], progress=None, cancelled=None) -> tuple[int, list[str]]:
+    """Delete files: to the Recycle Bin when send2trash is installed, permanently
+    otherwise. Only ever called for options the user turned on explicitly.
+    Returns (files deleted, error messages)."""
+    done, errors = 0, []
+    for n, p in enumerate(paths):
+        if cancelled and cancelled():
+            errors.append("Cancelled before finishing.")
+            break
+        if progress:
+            progress(n, len(paths), p.name)
+        try:
+            if send2trash is not None:
+                send2trash(str(p))
+            else:
+                p.unlink()
+            done += 1
+        except OSError as e:
+            errors.append(f"{p}: {e}")
+        except Exception as e:  # noqa: BLE001 - send2trash raises its own error types
+            errors.append(f"{p}: {e}")
+    if progress:
+        progress(len(paths), len(paths), "")
+    return done, errors
+
+
+# =============================================================== settings backup
+
+# Files in the settings folder that are not settings: histories point to paths
+# on this PC, and the checksum cache is rebuilt on its own.
+_NOT_SETTINGS = ("_history.json", "checksum_cache.json")
+
+
+def export_all_settings(path: str) -> list[str]:
+    """Save every tab's settings into one file. Returns the tool keys saved."""
+    bundle = {"app": APP_NAME, "version": APP_VERSION, "created": timestamp(), "settings": {}}
+    for f in sorted(config_dir().glob("*.json")):
+        if f.name.endswith(_NOT_SETTINGS):
+            continue
+        data = load_json(f, None)
+        if data is not None:
+            bundle["settings"][f.stem] = data
+    save_json(Path(path), bundle)
+    return list(bundle["settings"])
+
+
+def import_all_settings(path: str) -> list[str]:
+    """Restore settings saved with export_all_settings. Returns the tool keys restored."""
+    bundle = load_json(Path(path), None)
+    if not isinstance(bundle, dict) or not isinstance(bundle.get("settings"), dict):
+        raise ValueError("This file isn't a Media Toolbox settings backup.")
+    restored = []
+    for key, data in bundle["settings"].items():
+        # Only plain names like "video_sorter": never write outside the settings folder.
+        if re.fullmatch(r"[a-z0-9_]+", key) and isinstance(data, dict):
+            save_json(config_dir() / f"{key}.json", data)
+            restored.append(key)
+    return restored
+
+
+def save_text(path: str, build, *args) -> None:
+    """Build a text report and write it; meant to run in a background task,
+    since building a report of thousands of rows can take a moment."""
+    text = build(*args)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def require_folder(path: Path) -> None:
+    """Called at the start of background tasks, never on the GUI thread: on a
+    disconnected network drive even this one check can take many seconds."""
+    if not path.is_dir():
+        raise FileNotFoundError(f"'{path}' doesn't exist or isn't a folder.")
+
+
+def check_exists(paths: list[Path], progress=None, cancelled=None) -> set[str]:
+    """Which of these paths exist. Runs in the background: on network or sleeping
+    drives each check can take a while."""
+    found = set()
+    for n, p in enumerate(paths):
+        if cancelled and cancelled():
+            break
+        if progress and n % 50 == 0:
+            progress(n, len(paths), p.name)
+        if p.exists():
+            found.add(str(p))
+    return found
 
 
 def human_duration(seconds: float | None) -> str:
@@ -571,26 +857,43 @@ def selected_records(view: QTableView, proxy: RecordFilter) -> list[dict]:
     return [proxy.sourceModel().rows[r] for r in rows]
 
 
-def export_csv(path: str, columns: list[Column], rows: list[dict]) -> None:
+def export_csv(path: str, columns: list[Column], rows: list[dict], footer: list[list] | None = None) -> None:
+    """Write rows as CSV. After the data comes a blank line, any footer rows
+    (totals), and a "Created" row with the date and time of the export."""
     # utf-8-sig so Excel opens accented and Japanese names correctly.
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow([c.header or c.key for c in columns])
         for r in rows:
             w.writerow([("yes" if r.get(c.key) else "no") if c.check else r.get(c.key, "") for c in columns])
+        w.writerow([])
+        for extra in footer or []:
+            w.writerow(extra)
+        w.writerow(["Created", timestamp()])
+        w.writerow(["Version", APP_TITLE])
 
 
 # =============================================================== reusable widgets
+
+def _looks_local(path: str) -> bool:
+    """False for paths written for the other OS ("E:\\Videos" on Linux, "/run/media" on Windows)."""
+    windows_style = bool(re.match(r"^[A-Za-z]:[\\/]|^\\\\", path))
+    return windows_style if sys.platform.startswith("win") else not windows_style
+
 
 class FolderPicker(QWidget):
     """Editable dropdown of recent folders plus a Browse button.
     Emits `chosen(path)` on Enter, on Browse, and when a recent folder is picked."""
     chosen = Signal(str)
+    _checked = Signal(list, list)  # Background existence check -> GUI thread.
 
     def __init__(self, label: str, recent: list[str], placeholder: str = "",
                  browse_title: str = "Choose folder", parent=None):
         super().__init__(parent)
         self.browse_title = browse_title
+        self._candidates: list[str] = []
+        self._auto_text = ""
+        self._checked.connect(self._on_checked)
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         self.combo = QComboBox()
@@ -619,15 +922,42 @@ class FolderPicker(QWidget):
         return Path(t) if t else None
 
     def set_recent(self, recent: list[str]) -> None:
-        current = self.combo.currentText()
+        """Show recent folders right away, then drop the ones that don't exist.
+
+        Checking that a folder exists can hang for many seconds on a
+        disconnected network drive (like Z:), so that check runs in a
+        background thread and the list is trimmed when it finishes.
+        """
+        # Paths for the other OS are skipped at once (the list can mix Linux and Windows paths).
+        candidates = [p for p in recent if _looks_local(p)]
+        self._candidates = candidates
+        self._fill(candidates, self.combo.currentText())
+        self._auto_text = self.combo.currentText()
+
+        def check():
+            existing = [p for p in candidates if Path(p).is_dir()]
+            try:
+                self._checked.emit(candidates, existing)  # Queued to the GUI thread.
+            except RuntimeError:
+                pass  # The window closed while checking.
+
+        threading.Thread(target=check, daemon=True).start()
+
+    def _fill(self, items: list[str], current: str) -> None:
         self.combo.blockSignals(True)
         self.combo.clear()
-        # Only offer folders that exist here: the list can mix Linux and Windows paths.
-        for p in recent:
-            if Path(p).is_dir():
-                self.combo.addItem(p)
-        self.combo.setEditText(current if current else (self.combo.itemText(0) if self.combo.count() else ""))
+        self.combo.addItems(items)
+        self.combo.setEditText(current if current else (items[0] if items else ""))
         self.combo.blockSignals(False)
+
+    def _on_checked(self, candidates: list[str], existing: list[str]) -> None:
+        if candidates is not self._candidates and candidates != self._candidates:
+            return  # A newer list was set meanwhile.
+        current = self.combo.currentText()
+        # If the text was filled in automatically and that folder is gone, pick the next one.
+        if current == self._auto_text and current not in existing:
+            current = existing[0] if existing else ""
+        self._fill(existing, current)
 
     def browse(self) -> None:
         start = self.text() or str(Path.home())
@@ -707,7 +1037,12 @@ class ToolTab(QWidget):
     disabled, so other tabs keep working.
     """
     title = "Tool"
+    key = "tool"                 # Used by other tabs to send a folder here.
     busy_changed = Signal(bool)  # Lets the main window mark a working tab.
+    # Ask the main window to open a folder in another tab: (tab key, folder path).
+    open_in_tab = Signal(str, str)
+    # Set by the main window; when a tab runs on its own, links to other tabs are hidden.
+    linked = False
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -716,6 +1051,8 @@ class ToolTab(QWidget):
         self._worker: TaskWorker | None = None
         self._on_done = None
         self._on_partial = None
+        self.last_export_dir: Path | None = None
+        self._running: list[tuple] = []  # (thread, worker) pairs not fully stopped yet.
         self.setAcceptDrops(True)
 
         outer = QVBoxLayout(self)
@@ -767,14 +1104,79 @@ class ToolTab(QWidget):
             QMessageBox.warning(self, "Can't open", str(e))
 
     def ask_save(self, title: str, default_name: str, filters: str) -> str | None:
-        path, _ = QFileDialog.getSaveFileName(self, title, str(Path.home() / default_name), filters)
+        """Save dialog whose suggested name carries the current date and time."""
+        start = self.last_export_dir or Path.home()
+        path, _ = QFileDialog.getSaveFileName(self, title, str(start / stamped_name(default_name)), filters)
+        if path:
+            self.last_export_dir = Path(path).parent  # Next export suggests the same folder.
         return path or None
+
+    def save_in_background(self, fn, args: tuple, path: str, what: str = "") -> None:
+        """Write an export file without freezing the window, and remember it for
+        the "Open last CSV" / "Open last report" buttons."""
+        def done(_):
+            self.write_log(f"Saved {what + ' ' if what else ''}to {path}")
+            self._remember_export(path)
+        self.run_task(fn, args, done, f"Saving {Path(path).name}…")
+
+    # ---------------------------------------------------------- "Open last CSV / report"
+    # The last saved file of each kind, per tab, kept in last_exports.json so the
+    # buttons still work after a restart.
+    def _last_exports(self) -> dict:
+        data = load_json(config_dir() / "last_exports.json", {})
+        return data.get(self.key, {}) if isinstance(data, dict) else {}
+
+    def _remember_export(self, path: str) -> None:
+        data = load_json(config_dir() / "last_exports.json", {})
+        data = data if isinstance(data, dict) else {}
+        kind = "csv" if path.lower().endswith(".csv") else "report"
+        data.setdefault(self.key, {})[kind] = path
+        try:
+            save_json(config_dir() / "last_exports.json", data)
+        except OSError:
+            pass  # Only the shortcut is lost.
+        self._refresh_open_last()
+
+    def add_open_last_buttons(self, layout) -> None:
+        """Add the two buttons to a tab's button row."""
+        self._open_last_buttons = {}
+        for kind, label in (("csv", "Open last CSV"), ("report", "Open last report")):
+            b = QPushButton(label)
+            b.clicked.connect(lambda _=False, k=kind: self._open_last(k))
+            layout.addWidget(b)
+            self._open_last_buttons[kind] = b
+        self._refresh_open_last()
+
+    def _refresh_open_last(self) -> None:
+        last = self._last_exports()
+        for kind, b in getattr(self, "_open_last_buttons", {}).items():
+            # Not checked on disk (slow on network drives); a deleted file just shows a message.
+            b.setEnabled(bool(last.get(kind)))
+            b.setToolTip(last.get(kind) or "Nothing saved from this tab yet")
+
+    def _open_last(self, kind: str) -> None:
+        path = self._last_exports().get(kind)
+        if path:
+            self.safe_open(Path(path))
 
     def on_idle(self) -> None:
         """Called after a task finishes; override to refresh buttons."""
 
     def folder_dropped(self, path: Path) -> None:
         """Called when a folder is dropped on the tab; override to use it."""
+
+    def open_folder(self, path: Path) -> None:
+        """Another tab sent a folder here: same as dropping it on this tab."""
+        self.folder_dropped(path)
+
+    def add_link_actions(self, menu, folder: Path) -> None:
+        """Add "Check videos in this folder", etc. for the other tabs to a right-click menu."""
+        if not self.linked:
+            return
+        menu.addSeparator()
+        for key, label in TAB_LINKS:
+            if key != self.key:
+                menu.addAction(label, lambda k=key: self.open_in_tab.emit(k, str(folder)))
 
     # ---------------------------------------------------------- drag & drop
     def dragEnterEvent(self, e):
@@ -793,6 +1195,7 @@ class ToolTab(QWidget):
         GUI thread. If fn raises, the error is shown and on_done is not called."""
         if self._busy:
             return False
+        self._reap_threads()
         self._busy = True
         self._on_done, self._on_partial = on_done, on_partial
         self.body.setEnabled(False)
@@ -801,20 +1204,43 @@ class ToolTab(QWidget):
         self.cancel_btn.setEnabled(True)
         self.progress_row.show()
 
-        self._thread = QThread(self)
-        self._worker = TaskWorker(fn, args)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
+        thread = QThread(self)
+        worker = TaskWorker(fn, args)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
         # Bound methods of this widget are queued back to the GUI thread automatically.
-        self._worker.progress.connect(self._task_progress)
-        self._worker.partial.connect(self._task_partial)
-        self._worker.done.connect(self._task_done)
-        self._worker.done.connect(self._thread.quit)
-        self._thread.finished.connect(self._worker.deleteLater)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.start()
+        worker.progress.connect(self._task_progress)
+        worker.partial.connect(self._task_partial)
+        worker.done.connect(self._task_done)
+        worker.done.connect(thread.quit)
+        # Keep Python references until the thread has really stopped. Dropping them
+        # earlier (when "done" arrives) would let Python free the worker while its
+        # thread is still returning from run(), which can crash the app.
+        # "finished" is emitted from the worker thread; connecting it to a method of
+        # this widget makes the clean-up run on the GUI thread.
+        self._running.append((thread, worker))
+        thread.finished.connect(self._reap_threads)
+        self._thread, self._worker = thread, worker
+        thread.start()
         self.busy_changed.emit(True)
         return True
+
+    def _reap_threads(self) -> None:
+        """Free finished tasks. The worker is freed with its last Python reference,
+        the thread (a child of this widget) by Qt."""
+        still = []
+        for thread, worker in self._running:
+            if thread.isFinished():
+                thread.deleteLater()
+            else:
+                still.append((thread, worker))
+        self._running = still
+
+    def wait_for_threads(self) -> None:
+        """On close: let threads that just finished their work stop completely.
+        Destroying a QThread that's still stopping makes Qt abort the program."""
+        for thread, _worker in self._running:
+            thread.wait(3000)
 
     def cancel_task(self) -> None:
         if self._worker:
@@ -837,17 +1263,30 @@ class ToolTab(QWidget):
 
     def _task_done(self, result):
         self._busy = False
-        self._thread = self._worker = None
+        self._thread = self._worker = None  # Still referenced in _running until the thread stops.
         self.body.setEnabled(True)
         self.progress_row.hide()
         callback, self._on_done, self._on_partial = self._on_done, None, None
-        if isinstance(result, Exception):
+        if isinstance(result, FileNotFoundError):
+            self.write_log(str(result))  # A mistyped or disconnected folder: not a crash.
+            QMessageBox.warning(self, "Folder not found", str(result))
+        elif isinstance(result, Exception):
             self.write_log(f"Error: {result}")
             QMessageBox.critical(self, "Something went wrong", str(result))
         elif callback:
-            callback(result)
+            callback(result)  # May start another task (e.g. Scan -> movie length check).
         self.on_idle()
-        self.busy_changed.emit(False)
+        self.busy_changed.emit(self._busy)
+
+
+# Menu entries that send a folder to another tab, in the order they appear.
+TAB_LINKS = [
+    ("video_sorter", "Sort videos in this folder"),
+    ("video_check", "Check videos in this folder"),
+    ("episode_check", "Check episodes in this folder"),
+    ("file_list", "List files in this folder"),
+    ("music_check", "Check music tags in this folder"),
+]
 
 
 def missing_library_banner(package: str, extra: str = "") -> QLabel:
@@ -866,7 +1305,7 @@ def run_standalone(tab_cls) -> None:
     win = QMainWindow()
     tab = tab_cls()
     win.setCentralWidget(tab)
-    win.setWindowTitle(tab.title)
+    win.setWindowTitle(f"{tab.title} — {APP_TITLE}")
     win.resize(1100, 720)
 
     def close_event(e, _orig=win.closeEvent):
@@ -875,6 +1314,7 @@ def run_standalone(tab_cls) -> None:
             QMessageBox.information(win, "Still working", "Wait for the current task to finish, or cancel it.")
             e.ignore()
         else:
+            tab.wait_for_threads()
             e.accept()
 
     win.closeEvent = close_event
