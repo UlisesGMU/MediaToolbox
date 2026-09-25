@@ -7,8 +7,6 @@ its own tab of one window.
 
 Built with the assistance of Claude (Anthropic).
 
-**Version 3.4.0.** What changed in each version is in `CHANGELOG.md`.
-
 ## What it does
 
 **Video Sorter** (called Folder Sorter in earlier versions) — sorts video
